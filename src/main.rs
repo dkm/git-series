@@ -95,6 +95,15 @@ const WORKING_PREFIX: &'static str = "refs/git-series-internals/working/";
 const GIT_FILEMODE_BLOB: u32 = 0o100644;
 const GIT_FILEMODE_COMMIT: u32 = 0o160000;
 
+fn get_series_prefix(repo: &Repository) -> Result<String> {
+    let config = try!(repo.config());
+
+    match config.get_string("series.prefix"){
+        Ok(s) => {return Ok(s);},
+        _ => {return Ok(String::from(SERIES_PREFIX));},
+    }
+}
+
 fn zero_oid() -> Oid {
     Oid::from_bytes(b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00").unwrap()
 }
@@ -156,14 +165,15 @@ struct Internals<'repo> {
 impl<'repo> Internals<'repo> {
     fn read(repo: &'repo Repository) -> Result<Self> {
         let shead = try!(repo.find_reference(SHEAD_REF));
-        let series_name = try!(shead_series_name(&shead));
+        let series_name = try!(shead_series_name(&shead, repo));
         let mut internals = try!(Internals::read_series(repo, &series_name));
         try!(internals.update_series(repo));
         Ok(internals)
     }
 
     fn read_series(repo: &'repo Repository, series_name: &str) -> Result<Self> {
-        let committed_id = try!(notfound_to_none(repo.refname_to_id(&format!("{}{}", SERIES_PREFIX, series_name))));
+        let s_prefix = try!(get_series_prefix(repo));
+        let committed_id = try!(notfound_to_none(repo.refname_to_id(&format!("{}{}", s_prefix, series_name))));
         let maybe_get_ref = |prefix: &str| -> Result<TreeBuilder<'repo>> {
             match try!(notfound_to_none(repo.refname_to_id(&format!("{}{}", prefix, series_name)))).or(committed_id) {
                 Some(id) => {
@@ -181,7 +191,9 @@ impl<'repo> Internals<'repo> {
     }
 
     fn exists(repo: &'repo Repository, series_name: &str) -> Result<bool> {
-        for prefix in [SERIES_PREFIX, STAGED_PREFIX, WORKING_PREFIX].iter() {
+        let s_prefix = try!(get_series_prefix(repo));
+
+        for prefix in [&s_prefix, STAGED_PREFIX, WORKING_PREFIX].iter() {
             let prefixed_name = format!("{}{}", prefix, series_name);
             if try!(notfound_to_none(repo.refname_to_id(&prefixed_name))).is_some() {
                 return Ok(true);
@@ -230,7 +242,7 @@ impl<'repo> Internals<'repo> {
         let committer = try!(get_signature(&config, "COMMITTER"));
 
         let shead = try!(repo.find_reference(SHEAD_REF));
-        let series_name = try!(shead_series_name(&shead));
+        let series_name = try!(shead_series_name(&shead, repo));
         let maybe_commit = |prefix: &str, tb: &TreeBuilder| -> Result<()> {
             let tree_id = try!(tb.write());
             let refname = format!("{}{}", prefix, series_name);
@@ -310,24 +322,28 @@ fn unadd(repo: &Repository, m: &ArgMatches) -> Result<()> {
     internals.write(repo)
 }
 
-fn shead_series_name(shead: &Reference) -> Result<String> {
+fn shead_series_name(shead: &Reference, repo: &Repository) -> Result<String> {
     let shead_target = try!(shead.symbolic_target().ok_or("SHEAD not a symbolic reference"));
-    if !shead_target.starts_with(SERIES_PREFIX) {
-        return Err(format!("SHEAD does not start with {}", SERIES_PREFIX).into());
+    let s_prefix = try!(get_series_prefix(repo));
+
+    if !shead_target.starts_with(&s_prefix) {
+        return Err(format!("SHEAD does not start with {}", s_prefix).into());
     }
-    Ok(shead_target[SERIES_PREFIX.len()..].to_string())
+    Ok(shead_target[s_prefix.len()..].to_string())
 }
 
 fn series(out: &mut Output, repo: &Repository) -> Result<()> {
     let mut refs = Vec::new();
-    for prefix in [SERIES_PREFIX, STAGED_PREFIX, WORKING_PREFIX].iter() {
+    let s_prefix = try!(get_series_prefix(repo));
+
+    for prefix in [&s_prefix, STAGED_PREFIX, WORKING_PREFIX].iter() {
         let l = prefix.len();
         for r in try!(repo.references_glob(&[prefix, "*"].concat())).names() {
             refs.push(try!(r)[l..].to_string());
         }
     }
     let shead_target = if let Some(shead) = try!(notfound_to_none(repo.find_reference(SHEAD_REF))) {
-        Some(try!(shead_series_name(&shead)))
+        Some(try!(shead_series_name(&shead, repo)))
     } else {
         None
     };
@@ -339,13 +355,15 @@ fn series(out: &mut Output, repo: &Repository) -> Result<()> {
     try!(out.auto_pager(&config, "branch", false));
     let color_current = try!(out.get_color(&config, "branch", "current", "green"));
     let color_plain = try!(out.get_color(&config, "branch", "plain", "normal"));
+    let s_prefix = try!(get_series_prefix(repo));
+
     for name in refs.iter() {
         let (star, color) = if Some(name) == shead_target.as_ref() {
             ('*', color_current)
         } else {
             (' ', color_plain)
         };
-        let new = if try!(notfound_to_none(repo.refname_to_id(&format!("{}{}", SERIES_PREFIX, name)))).is_none() {
+        let new = if try!(notfound_to_none(repo.refname_to_id(&format!("{}{}", s_prefix, name)))).is_none() {
             " (new, no commits yet)"
         } else {
             ""
@@ -367,7 +385,9 @@ fn start(repo: &Repository, m: &ArgMatches) -> Result<()> {
     if try!(Internals::exists(repo, name)) {
         return Err(format!("Series {} already exists.\nUse checkout to resume working on an existing patch series.", name).into());
     }
-    let prefixed_name = &[SERIES_PREFIX, name].concat();
+    let s_prefix = try!(get_series_prefix(repo));
+
+    let prefixed_name = &[&s_prefix, name].concat();
     try!(repo.reference_symbolic(SHEAD_REF, &prefixed_name, true, &format!("git series start {}", name)));
 
     let internals = try!(Internals::read(repo));
@@ -447,7 +467,8 @@ fn checkout(repo: &Repository, m: &ArgMatches) -> Result<()> {
     let head_id = head_commit.as_object().id();
     println!("Previous HEAD position was {}", try!(commit_summarize(&repo, head_id)));
 
-    let prefixed_name = &[SERIES_PREFIX, name].concat();
+    let s_prefix = try!(get_series_prefix(repo));
+    let prefixed_name = &[&s_prefix, name].concat();
     try!(repo.reference_symbolic(SHEAD_REF, &prefixed_name, true, &format!("git series checkout {}", name)));
     try!(internals.write(repo));
 
@@ -522,7 +543,7 @@ fn detach(repo: &Repository) -> Result<()> {
 fn delete(repo: &Repository, m: &ArgMatches) -> Result<()> {
     let name = m.value_of("name").unwrap();
     if let Ok(shead) = repo.find_reference(SHEAD_REF) {
-        let shead_target = try!(shead_series_name(&shead));
+        let shead_target = try!(shead_series_name(&shead, repo));
         if shead_target == name {
             return Err(format!("Cannot delete the current series \"{}\"; detach first.", name).into());
         }
@@ -745,7 +766,7 @@ fn commit_status(out: &mut Output, repo: &Repository, m: &ArgMatches, do_status:
         Err(ref e) if e.code() == git2::ErrorCode::NotFound => { println!("No series; use \"git series start <name>\" to start"); return Ok(()); }
         result => try!(result),
     };
-    let series_name = try!(shead_series_name(&shead));
+    let series_name = try!(shead_series_name(&shead, repo));
 
     if do_status {
         try!(out.auto_pager(&config, "status", false));
@@ -978,7 +999,7 @@ fn cover(repo: &Repository, m: &ArgMatches) -> Result<()> {
 
 fn cp_mv(repo: &Repository, m: &ArgMatches, mv: bool) -> Result<()> {
     let shead_target = if let Some(shead) = try!(notfound_to_none(repo.find_reference(SHEAD_REF))) {
-        Some(try!(shead_series_name(&shead)))
+        Some(try!(shead_series_name(&shead, repo)))
     } else {
         None
     };
@@ -1821,7 +1842,7 @@ fn req(out: &mut Output, repo: &Repository, m: &ArgMatches) -> Result<()> {
         let (subject, body) = split_message(&content);
         (Some(content.to_string()), subject.to_string(), Some(body.to_string()))
     } else {
-        (None, try!(shead_series_name(&shead)), None)
+        (None, try!(shead_series_name(&shead, repo)), None)
     };
 
     let url = m.value_of("url").unwrap();
