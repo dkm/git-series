@@ -893,6 +893,28 @@ fn commit_status(out: &mut Output, repo: &Repository, m: &ArgMatches, do_status:
         }
     }
 
+    let no_merge = try!(notfound_to_none(config.get_bool(&format!("series.nomerge")))).unwrap_or(false);
+    if no_merge {
+        let tree1 = shead_tree.as_ref();
+        let tree2 = Some(&tree);
+
+        let base1 = tree1.and_then(|t| t.get_name("base"));
+        let series1 = tree1.and_then(|t| t.get_name("series"));
+        let base2 = tree2.and_then(|t| t.get_name("base"));
+        let series2 = tree2.and_then(|t| t.get_name("series"));
+
+        if let (Some(base1), Some(series1), Some(base2), Some(series2)) = (base1, series1, base2, series2) {
+            let commits1 = try!(get_commits(repo, base1.id(), series1.id()));
+
+            let commits2 = try!(get_commits(repo, base2.id(), series2.id()));
+            for commit in commits1.iter().chain(commits2.iter()) {
+                if commit.parent_ids().count() > 1 {
+                    return Err(format!("Aborting series commit due to merge commit {}.", commit.id()).into());
+                }
+            }
+        }
+    }
+
     let msg = match m.value_of("m") {
         Some(s) => s.to_string(),
         None => {
