@@ -21,7 +21,7 @@ use std::process::Command;
 use ansi_term::Style;
 use chrono::offset::TimeZone;
 use clap::{App, AppSettings, Arg, ArgGroup, ArgMatches, SubCommand};
-use git2::{Config, Commit, Delta, Diff, Object, ObjectType, Oid, Reference, Repository, Tree, TreeBuilder};
+use git2::{BranchType, Config, Commit, Delta, Diff, Object, ObjectType, Oid, Reference, Repository, RemoteCallbacks, PushOptions, Tree, TreeBuilder};
 use tempdir::TempDir;
 
 quick_error! {
@@ -88,6 +88,8 @@ const SCISSOR_COMMENT: &'static str = "\
 const SHELL_METACHARS: &'static str = "|&;<>()$`\\\"' \t\n*?[#~=%";
 
 const SERIES_PREFIX: &'static str = "refs/heads/git-series/";
+const SERIES_BRANCH_PREFIX: &'static str = "git-series/";
+
 const SHEAD_REF: &'static str = "refs/SHEAD";
 const STAGED_PREFIX: &'static str = "refs/git-series-internals/staged/";
 const WORKING_PREFIX: &'static str = "refs/git-series-internals/working/";
@@ -101,6 +103,15 @@ fn get_series_prefix(repo: &Repository) -> Result<String> {
     match config.get_string("series.prefix"){
         Ok(s) => {return Ok(s);},
         _ => {return Ok(String::from(SERIES_PREFIX));},
+    }
+}
+
+fn get_series_branch_prefix(repo: &Repository) -> Result<String> {
+    let config = try!(repo.config());
+
+    match config.get_string("series.branchprefix"){
+        Ok(s) => {return Ok(s);},
+        _ => {return Ok(String::from(SERIES_BRANCH_PREFIX));},
     }
 }
 
@@ -1722,6 +1733,85 @@ fn log(out: &mut Output, repo: &Repository, m: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
+fn push(repo: &Repository, m: &ArgMatches) -> Result<()> {
+    let remotes = repo.remotes().unwrap();
+
+    let mut cb = RemoteCallbacks::new();
+
+    cb.push_update_reference(|name, status| {
+        match status {
+            Some(_) => println!("Push to {} rejected", name),
+            _ => println!("Push to {} accepted", name)
+        }
+        Ok(())
+    });
+
+    let mut opts = PushOptions::new();
+    opts.remote_callbacks(cb);
+
+    let arg_remote_name = m.value_of("repository");
+    let arg_refspec = m.value_of("refspec");
+
+    let shead = try!(repo.find_reference(SHEAD_REF));
+
+    let local_branch_name = &format!("{}{}", try!(get_series_branch_prefix(repo)), shead_series_name(&shead, repo).unwrap());
+
+    let local_branch = repo.find_branch(local_branch_name,
+                                        BranchType::Local).unwrap();
+
+    // If there is upstream info AND nothing on the command line to override it.
+    let use_upstream = local_branch.upstream().is_ok() && !arg_remote_name.is_some();
+
+    if use_upstream {
+        let upstream = local_branch.upstream()?;
+
+        if let Ok(name) = upstream.name() {
+            if let Some(real_name) = name {
+                let real_name_refspec = &format!("refs/remotes/{}",
+                                                 real_name);
+
+                for rem_name in remotes.iter() {
+                    let mut remote = repo.find_remote(rem_name.unwrap())?;
+                    let mut found = false;
+
+                    for refsp in remote.refspecs() {
+                        if refsp.dst_matches(real_name_refspec) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        if let Err(e) = remote.push(&[real_name_refspec], Some(&mut opts)) {
+                            println!("NOT pushed! : {}", e);
+                        }
+                    }
+                }
+            } else {
+                return Err("bad name in upstream ?!".into());
+            }
+        } else {
+            return Err("no name in upstream ?!".into());
+        }
+    } else {
+        println!("No upstream branch");
+        if let Some(arg_remote_name) = arg_remote_name {
+            let remote_ref = &format!("refs/heads/{}{}:refs/heads/{}",
+                                      try!(get_series_branch_prefix(repo)), shead_series_name(&shead, repo).unwrap(),
+                                      match arg_refspec {
+                                          Some(refspec) => refspec,
+                                          _ => local_branch_name
+                                      });
+            let mut remote = repo.find_remote(arg_remote_name)?;
+
+            if let Err(e) = remote.push(&[remote_ref], Some(&mut opts)) {
+                println!("NOT pushed! : {}", e);
+            }
+        }
+    }
+
+    Ok(())
+ }
+
 fn rebase(repo: &Repository, m: &ArgMatches) -> Result<()> {
     match repo.state() {
         git2::RepositoryState::Clean => (),
@@ -2037,6 +2127,11 @@ fn main() {
                     .about("Move (rename) a patch series")
                     .visible_alias("rename")
                     .arg(Arg::with_name("source_dest").required(true).min_values(1).max_values(2).help("source (default: current series) and destination (required)")),
+                SubCommand::with_name("push")
+                    .about("Push the patch series")
+//                    .arg_from_usage("[-u | --set-upstream] 'Add upstream (tracking) reference.'")
+                    .arg_from_usage("[repository] 'The remote repository that is destination of the push.'")
+                    .arg_from_usage("[refspec] 'The destination ref to update.'"),
                 SubCommand::with_name("rebase")
                     .about("Rebase the patch series")
                     .arg_from_usage("[onto] 'Commit to rebase onto'")
@@ -2076,6 +2171,7 @@ fn main() {
             ("format", Some(ref sm)) => format(&mut out, &repo, &sm),
             ("log", Some(ref sm)) => log(&mut out, &repo, &sm),
             ("mv", Some(ref sm)) => cp_mv(&repo, &sm, true),
+            ("push", Some(ref sm)) => push(&repo, &sm),
             ("rebase", Some(ref sm)) => rebase(&repo, &sm),
             ("req", Some(ref sm)) => req(&mut out, &repo, &sm),
             ("start", Some(ref sm)) => start(&repo, &sm),
