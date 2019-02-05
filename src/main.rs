@@ -471,6 +471,9 @@ fn checkout(repo: &Repository, m: &ArgMatches) -> Result<()> {
     let new_head_id = try!(try!(internals.working.get("series")).ok_or(format!("Could not find \"series\" in \"{}\"", name))).id();
     let new_head = try!(repo.find_commit(new_head_id)).into_object();
 
+    let config = try!(try!(repo.config()).snapshot());
+    let _committer = try!(get_signature(&config, "COMMITTER"));
+
     try!(checkout_tree(repo, &new_head));
 
     let head = try!(repo.head());
